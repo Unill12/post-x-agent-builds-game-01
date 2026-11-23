@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Dodge</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050510; overflow: hidden; height: 100%; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0;
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- helpers ----------
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function dist2(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  // ---------- starfield ----------
+  var stars = [];
+  for (var i = 0; i < 140; i++) {
+    stars.push({ x: Math.random(), y: Math.random(), s: rand(0.5, 2.2), tw: rand(0, 6.28), sp: rand(0.2, 1.0) });
+  }
+
+  // ---------- game state ----------
+  var state = 'play'; // 'play' | 'over'
+  var score = 0;
+  var lives = 3;
+  var elapsed = 0;
+  var spawnTimer = 0;
+  var starTimer = 0;
+  var flash = 0;
+
+  var ship = {
+    x: 0, y: 0, r: 26, vx: 0, vy: 0,
+    speed: 560, invuln: 0, tilt: 0
+  };
+  ship.x = W / 2;
+  ship.y = H - 130;
+
+  var keys = {};
+  var mouse = { x: null, y: null, active: false };
+
+  var rocks = [];   // asteroids
+  var pickups = []; // stars to collect
+  var parts = [];   // explosion particles
+
+  window.addEventListener('keydown', function (e) {
+    keys[e.key.toLowerCase()] = true;
+    if (e.key === 'r' || e.key === 'R') { if (state === 'over') reset(); }
+    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].indexOf(e.key.toLowerCase()) >= 0) e.preventDefault();
+  });
+  window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+  window.addEventListener('mousemove', function (e) { mouse.x = e.clientX; mouse.y = e.clientY; mouse.active = true; });
+  window.addEventListener('mousedown', function () { if (state === 'over') reset(); });
+  window.addEventListener('touchstart', function (e) {
+    var t = e.touches[0];
+    mouse.x = t.clientX; mouse.y = t.clientY; mouse.active = true;
+    if (state === 'over') reset();
+  }, { passive: true });
+
+  function reset() {
+    state = 'play';
+    score = 0; lives = 3; elapsed = 0;
+    spawnTimer = 0; starTimer = 0; flash = 0;
+    rocks = []; pickups = []; parts = [];
+    ship.x = W / 2; ship.y = H - 130;
+    ship.vx = 0; ship.vy = 0; ship.invuln = 0;
+  }
+
+  function difficulty() {
+    // 0 at start, ramps to 1 over ~60 seconds
+    return clamp(elapsed / 60, 0, 1);
+  }
+
+  function spawnRock() {
+    var d = difficulty();
+    var r = rand(16, 42);
+    rocks.push({
+      x: rand(r, W - r), y: -r - 10,
+      r: r, vy: rand(170, 240) + d * 200,
+      vx: rand(-40, 40), rot: rand(0, 6.28), vr: rand(-1.6, 1.6),
+      n: 7 + Math.floor(rand(0, 3)), // polygon points
+      seed: rand(0, 100)
+    });
+  }
+
+  function spawnStar() {
+    pickups.push({ x: rand(24, W - 24), y: -20, r: 12, vy: 150, spin: rand(0, 6.28) });
+  }
+
+  function explode(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = rand(0, 6.283);
+      var sp = rand(60, 320);
+      parts.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.4, 0.9), max: 0.9, r: rand(2, 5), color: color });
+    }
+  }
+
+  // ---------- update ----------
+  function update(dt) {
+    elapsed += dt;
+    score += dt * 1; // survival points
+
+    // starfield drift
+    for (var i = 0; i < stars.length; i++) {
+      stars[i].y += stars[i].sp * dt * 0.03;
+      if (stars[i].y > 1) { stars[i].y = 0; stars[i].x = Math.random(); }
+    }
+
+    if (state !== 'play') {
+      updateParts(dt);
+      return;
+    }
+
+    // ship steering: keys + mouse
+    var ax = 0, ay = 0;
+    if (keys['arrowleft'] || keys['a']) ax -= 1;
+    if (keys['arrowright'] || keys['d']) ax += 1;
+    if (keys['arrowup'] || keys['w']) ay -= 1;
+    if (keys['arrowdown'] || keys['s']) ay += 1;
+    if (ax !== 0 || ay !== 0) {
+      var len = Math.sqrt(ax * ax + ay * ay);
+      ship.vx = (ax / len) * ship.speed;
+      ship.vy = (ay / len) * ship.speed;
+      mouse.active = false;
+    } else if (mouse.active && mouse.x !== null) {
+      var dx = mouse.x - ship.x, dy = (mouse.y - 90) - ship.y;
+      ship.vx = clamp(dx * 8, -ship.speed, ship.speed);
+      ship.vy = clamp(dy * 8, -ship.speed, ship.speed);
+    } else {
+      ship.vx *= 0.86; ship.vy *= 0.86;
+    }
+    ship.x = clamp(ship.x + ship.vx * dt, 26, W - 26);
+    ship.y = clamp(ship.y + ship.vy * dt, H * 0.35, H - 40);
+    ship.tilt = clamp(ship.vx / ship.speed, -1, 1) * 0.35;
+    if (ship.invuln > 0) ship.invuln -= dt;
+    if (flash > 0) flash -= dt;
+
+    // spawns
+    var d = difficulty();
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnRock();
+      spawnTimer = rand(0.45, 0.7) - d * 0.25;
+    }
+    starTimer -= dt;
+    if (starTimer <= 0) {
+      spawnStar();
+      starTimer = rand(0.55, 0.9);
+    }
+
+    // rocks
+    for (var j = rocks.length - 1; j >= 0; j--) {
+      var rk = rocks[j];
+      rk.y += rk.vy * dt;
+      rk.x += rk.vx * dt;
+      rk.rot += rk.vr * dt;
+      if (rk.y - rk.r > H) { rocks.splice(j, 1); continue; }
+      if (ship.invuln <= 0 && dist2(rk.x, rk.y, ship.x, ship.y) < (rk.r + ship.r - 8) * (rk.r + ship.r - 8)) {
+        rocks.splice(j, 1);
+        lives -= 1;
+        ship.invuln = 1.6;
+        flash = 0.35;
+        explode(ship.x, ship.y, '#ff2e88', 26);
+        if (lives <= 0) {
+          state = 'over';
+          explode(ship.x, ship.y, '#00f0ff', 40);
+        }
+      }
+    }
+
+    // stars
+    for (var k = pickups.length - 1; k >= 0; k--) {
+      var pk = pickups[k];
+      pk.y += pk.vy * dt;
+      pk.spin += dt * 4;
+      if (pk.y - pk.r > H) { pickups.splice(k, 1); continue; }
+      if (dist2(pk.x, pk.y, ship.x, ship.y) < (pk.r + ship.r + 6) * (pk.r + ship.r + 6)) {
+        pickups.splice(k, 1);
+        score += 10;
+        explode(pk.x, pk.y, '#ffd319', 10);
+      }
+    }
+
+    updateParts(dt);
+  }
+
+  function updateParts(dt) {
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.96; p.vy *= 0.96;
+      p.life -= dt;
+      if (p.life <= 0) parts.splice(i, 1);
+    }
+  }
+
+  // ---------- draw ----------
+  function drawRock(rk) {
+    ctx.save();
+    ctx.translate(rk.x, rk.y);
+    ctx.rotate(rk.rot);
+    ctx.beginPath();
+    for (var i = 0; i < rk.n; i++) {
+      var a = (i / rk.n) * 6.283;
+      var rr = rk.r * (0.78 + 0.22 * Math.sin(rk.seed + i * 2.7));
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = '#241a33';
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = '#ff5c1f';
+    ctx.shadowColor = '#ff5c1f';
+    ctx.shadowBlur = 12;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawStar(pk) {
+    ctx.save();
+    ctx.translate(pk.x, pk.y);
+    ctx.rotate(pk.spin);
+    var s = pk.r;
+    ctx.beginPath();
+    ctx.moveTo(0, -s);
+    ctx.lineTo(s * 0.28, -s * 0.28);
+    ctx.lineTo(s, 0);
+    ctx.lineTo(s * 0.28, s * 0.28);
+    ctx.lineTo(0, s);
+    ctx.lineTo(-s * 0.28, s * 0.28);
+    ctx.lineTo(-s, 0);
+    ctx.lineTo(-s * 0.28, -s * 0.28);
+    ctx.closePath();
+    ctx.fillStyle = '#ffd319';
+    ctx.shadowColor = '#ffd319';
+    ctx.shadowBlur = 16;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawShip() {
+    if (ship.invuln > 0 && Math.floor(ship.invuln * 12) % 2 === 0) return; // blink
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    ctx.rotate(ship.tilt);
+    ctx.beginPath();
+    ctx.moveTo(0, -30);
+    ctx.lineTo(21, 18);
+    ctx.lineTo(8, 11);
+    ctx.lineTo(0, 20);
+    ctx.lineTo(-8, 11);
+    ctx.lineTo(-21, 18);
+    ctx.closePath();
+    ctx.fillStyle = '#0b2b3a';
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = '#00f0ff';
+    ctx.shadowColor = '#00f0ff';
+    ctx.shadowBlur = 18;
+    ctx.stroke();
+    // cockpit
+    ctx.beginPath();
+    ctx.arc(0, -6, 5, 0, 6.283);
+    ctx.fillStyle = '#a5fbff';
+    ctx.shadowBlur = 12;
+    ctx.fill();
+    // engine flame
+    var fl = 14 + Math.sin(elapsed * 30) * 6;
+    ctx.beginPath();
+    ctx.moveTo(-6, 18);
+    ctx.lineTo(0, 18 + fl);
+    ctx.lineTo(6, 18);
+    ctx.closePath();
+    ctx.fillStyle = '#ff9a3d';
+    ctx.shadowColor = '#ff9a3d';
+    ctx.shadowBlur = 20;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function draw() {
+    // background
+    ctx.fillStyle = '#050510';
+    ctx.fillRect(0, 0, W, H);
+
+    // nebula blobs
+    var g1 = ctx.createRadialGradient(W * 0.2, H * 0.25, 0, W * 0.2, H * 0.25, W * 0.45);
+    g1.addColorStop(0, 'rgba(120, 40, 180, 0.16)');
+    g1.addColorStop(1, 'rgba(120, 40, 180, 0)');
+    ctx.fillStyle = g1;
+    ctx.fillRect(0, 0, W, H);
+    var g2 = ctx.createRadialGradient(W * 0.85, H * 0.7, 0, W * 0.85, H * 0.7, W * 0.4);
+    g2.addColorStop(0, 'rgba(0, 120, 160, 0.14)');
+    g2.addColorStop(1, 'rgba(0, 120, 160, 0)');
+    ctx.fillStyle = g2;
+    ctx.fillRect(0, 0, W, H);
+
+    // starfield
+    for (var i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      var a = 0.35 + 0.65 * Math.abs(Math.sin(st.tw + elapsed * 0.8));
+      ctx.globalAlpha = a;
+      ctx.fillStyle = '#cfe8ff';
+      ctx.fillRect(st.x * W, st.y * H, st.s, st.s);
+    }
+    ctx.globalAlpha = 1;
+
+    // entities
+    for (var k = 0; k < pickups.length; k++) drawStar(pickups[k]);
+    for (var j = 0; j < rocks.length; j++) drawRock(rocks[j]);
+    for (var p = 0; p < parts.length; p++) {
+      var pt = parts[p];
+      ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.r, 0, 6.283);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (state === 'play') drawShip();
+
+    // HUD
+    ctx.textBaseline = 'top';
+    ctx.font = '700 34px "DejaVu Sans", sans-serif';
+    ctx.fillStyle = '#eafcff';
+    ctx.shadowColor = '#00f0ff';
+    ctx.shadowBlur = 10;
+    ctx.fillText('SCORE ' + Math.floor(score), 28, 24);
+    ctx.shadowBlur = 0;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ff2e88';
+    ctx.shadowColor = '#ff2e88';
+    ctx.shadowBlur = 10;
+    var hearts = '';
+    for (var h = 0; h < 3; h++) hearts += (h < lives) ? '\u2665 ' : '\u2661 ';
+    ctx.fillText(hearts, W - 28, 24);
+    ctx.textAlign = 'left';
+    ctx.shadowBlur = 0;
+    ctx.font = '600 20px "DejaVu Sans", sans-serif';
+    ctx.fillStyle = 'rgba(234, 252, 255, 0.75)';
+    ctx.fillText('LEVEL ' + (1 + Math.floor(difficulty() * 5)), 28, 66);
+
+    // hit flash
+    if (flash > 0) {
+      ctx.globalAlpha = clamp(flash * 1.6, 0, 0.55);
+      ctx.fillStyle = '#ff2e63';
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    // game over
+    if (state === 'over') {
+      ctx.fillStyle = 'rgba(5, 5, 16, 0.72)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '800 92px "DejaVu Sans", sans-serif';
+      ctx.fillStyle = '#ff2e88';
+      ctx.shadowColor = '#ff2e88';
+      ctx.shadowBlur = 28;
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 70);
+      ctx.shadowBlur = 0;
+      ctx.font = '700 44px "DejaVu Sans", sans-serif';
+      ctx.fillStyle = '#eafcff';
+      ctx.fillText('SCORE ' + Math.floor(score), W / 2, H / 2 + 20);
+      ctx.font = '600 30px "DejaVu Sans", sans-serif';
+      ctx.fillStyle = 'rgba(234, 252, 255, 0.8)';
+      ctx.fillText('press R or click to restart', W / 2, H / 2 + 90);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+    }
+  }
+
+  // ---------- main loop ----------
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
